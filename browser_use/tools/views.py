@@ -139,7 +139,7 @@ class SendKeysAction(BaseModel):
 
 class UploadFileAction(BaseModel):
 	index: int
-	path: str
+	path: str | list[str] = Field(description='Path or list of paths to the file(s) to upload.')
 
 
 class NoParamsAction(BaseModel):

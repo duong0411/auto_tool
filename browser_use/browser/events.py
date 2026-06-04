@@ -249,7 +249,7 @@ class UploadFileEvent(ElementSelectedEvent[None]):
 	"""Upload a file to an element."""
 
 	node: 'EnhancedDOMTreeNode'
-	file_path: str
+	file_path: str | list[str]
 
 	event_timeout: float | None = Field(default_factory=lambda: _get_timeout('TIMEOUT_UploadFileEvent', 30.0))  # seconds
 

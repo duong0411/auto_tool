@@ -2664,25 +2664,31 @@ class DefaultActionWatchdog(BaseWatchdog):
 			cdp_client = self.browser_session.cdp_client
 			session_id = await self._get_session_id_for_element(element_node)
 
-			# Validate file before upload
-			if os.path.exists(event.file_path):
-				file_size = os.path.getsize(event.file_path)
-				if file_size == 0:
-					msg = f'Upload failed - file {event.file_path} is empty (0 bytes).'
-					raise BrowserError(message=msg, long_term_memory=msg)
-				self.logger.debug(f'📎 File {event.file_path} validated ({file_size} bytes)')
+			# Convert file_path to list of paths
+			file_paths = event.file_path if isinstance(event.file_path, list) else [event.file_path]
+
+			# Validate files before upload
+			valid_paths = []
+			for path in file_paths:
+				if os.path.exists(path):
+					file_size = os.path.getsize(path)
+					if file_size == 0:
+						msg = f'Upload failed - file {path} is empty (0 bytes).'
+						raise BrowserError(message=msg, long_term_memory=msg)
+					self.logger.debug(f'📎 File {path} validated ({file_size} bytes)')
+				valid_paths.append(path)
 
 			# Set file(s) to upload
 			backend_node_id = element_node.backend_node_id
 			await cdp_client.send.DOM.setFileInputFiles(
 				params={
-					'files': [event.file_path],
+					'files': valid_paths,
 					'backendNodeId': backend_node_id,
 				},
 				session_id=session_id,
 			)
 
-			self.logger.info(f'📎 Uploaded file {event.file_path} to element {index_for_logging}')
+			self.logger.info(f'📎 Uploaded file(s) {valid_paths} to element {index_for_logging}')
 		except Exception as e:
 			raise
 

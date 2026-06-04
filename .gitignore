@@ -16,6 +16,8 @@ venv/
 # IDEs
 .vscode/
 .idea/
+.env/
+.env.example/
 
 # Build files
 dist/

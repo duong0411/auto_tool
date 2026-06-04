@@ -839,60 +839,54 @@ class Tools(Generic[Context]):
 		async def upload_file(
 			params: UploadFileAction, browser_session: BrowserSession, available_file_paths: list[str], file_system: FileSystem
 		):
-			# Check if file is in available_file_paths (user-provided or downloaded files)
-			# For remote browsers (is_local=False), we allow absolute remote paths even if not tracked locally
-			if params.path not in available_file_paths:
-				# Also check if it's a recently downloaded file that might not be in available_file_paths yet
-				downloaded_files = browser_session.downloaded_files
-				if params.path not in downloaded_files:
-					# Finally, check if it's a file in the FileSystem service.
-					# Only rewrite to the local FileSystem path on local sessions —
-					# on remote sessions, params.path is meant to address a file on
-					# the remote machine, and a coincidental basename collision with
-					# a local managed file (e.g. `/tmp/note.md` colliding with a
-					# local `note.md`) must not silently upload the local file.
-					if browser_session.is_local and file_system and file_system.get_dir():
-						# Check if the file is actually managed by the FileSystem service
-						# The path should be just the filename for FileSystem files
-						file_obj = file_system.get_file(params.path)
-						if file_obj:
-							# Construct the upload path from the FileSystem-owned basename
-							# (file_obj.full_name), NOT from params.path. The agent-controlled
-							# params.path may contain '..' traversal sequences that escape
-							# data_dir when naively joined — get_file() matches by basename
-							# so a path like '../../../note.md' would otherwise resolve to a
-							# sibling file outside the FileSystem directory.
-							# GHSA-j9hj-92j8-jv9h.
-							file_system_path = str(file_system.get_dir() / file_obj.full_name)
-							# Defense in depth: refuse any path that resolves outside data_dir.
-							real_path = os.path.realpath(file_system_path)
-							real_dir = os.path.realpath(str(file_system.get_dir()))
-							if not (real_path == real_dir or real_path.startswith(real_dir + os.sep)):
-								msg = f'Upload of {params.path!r} escapes FileSystem directory; refusing.'
+			paths = params.path if isinstance(params.path, list) else [params.path]
+			validated_paths = []
+
+			for path in paths:
+				# Check if file is in available_file_paths (user-provided or downloaded files)
+				# For remote browsers (is_local=False), we allow absolute remote paths even if not tracked locally
+				if path not in available_file_paths:
+					# Also check if it's a recently downloaded file that might not be in available_file_paths yet
+					downloaded_files = browser_session.downloaded_files
+					if path not in downloaded_files:
+						# Finally, check if it's a file in the FileSystem service.
+						if browser_session.is_local and file_system and file_system.get_dir():
+							file_obj = file_system.get_file(path)
+							if file_obj:
+								file_system_path = str(file_system.get_dir() / file_obj.full_name)
+								# Defense in depth: refuse any path that resolves outside data_dir.
+								real_path = os.path.realpath(file_system_path)
+								real_dir = os.path.realpath(str(file_system.get_dir()))
+								if not (real_path == real_dir or real_path.startswith(real_dir + os.sep)):
+									msg = f'Upload of {path!r} escapes FileSystem directory; refusing.'
+									logger.error(f'❌ {msg}')
+									return ActionResult(error=msg)
+								validated_paths.append(file_system_path)
+								continue
+							else:
+								msg = f'File path {path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{path}"])'
 								logger.error(f'❌ {msg}')
 								return ActionResult(error=msg)
-							params = UploadFileAction(index=params.index, path=file_system_path)
 						else:
-							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
-							logger.error(f'❌ {msg}')
-							return ActionResult(error=msg)
-					else:
-						# If browser is remote, allow passing a remote-accessible absolute path
-						if not browser_session.is_local:
-							pass
-						else:
-							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
-							raise BrowserError(message=msg, long_term_memory=msg)
+							# If browser is remote, allow passing a remote-accessible absolute path
+							if not browser_session.is_local:
+								validated_paths.append(path)
+								continue
+							else:
+								msg = f'File path {path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{path}"])'
+								raise BrowserError(message=msg, long_term_memory=msg)
+				validated_paths.append(path)
 
-			# For local browsers, ensure the file exists and has content
+			# For local browsers, ensure all files exist and have content
 			if browser_session.is_local:
-				if not os.path.exists(params.path):
-					msg = f'File {params.path} does not exist'
-					return ActionResult(error=msg)
-				file_size = os.path.getsize(params.path)
-				if file_size == 0:
-					msg = f'File {params.path} is empty (0 bytes). The file may not have been saved correctly.'
-					return ActionResult(error=msg)
+				for path in validated_paths:
+					if not os.path.exists(path):
+						msg = f'File {path} does not exist'
+						return ActionResult(error=msg)
+					file_size = os.path.getsize(path)
+					if file_size == 0:
+						msg = f'File {path} is empty (0 bytes). The file may not have been saved correctly.'
+						return ActionResult(error=msg)
 
 			# Get the selector map to find the node
 			selector_map = await browser_session.get_selector_map()
@@ -957,18 +951,17 @@ class Tools(Generic[Context]):
 					msg = 'No file upload element found on the page'
 					logger.error(msg)
 					raise BrowserError(msg)
-					# TODO: figure out why this fails sometimes + add fallback hail mary, just look for any file input on page
 
-			# Dispatch upload file event with the file input node
+			# Dispatch upload file event with the file input node and the list of validated paths
 			try:
-				event = browser_session.event_bus.dispatch(UploadFileEvent(node=file_input_node, file_path=params.path))
+				event = browser_session.event_bus.dispatch(UploadFileEvent(node=file_input_node, file_path=validated_paths))
 				await event
 				await event.event_result(raise_if_any=True, raise_if_none=False)
-				msg = f'Successfully uploaded file to index {params.index}'
+				msg = f'Successfully uploaded file(s) to index {params.index}'
 				logger.info(f'📁 {msg}')
 				return ActionResult(
 					extracted_content=msg,
-					long_term_memory=f'Uploaded file {params.path} to element {params.index}',
+					long_term_memory=f'Uploaded file(s) {validated_paths} to element {params.index}',
 				)
 			except Exception as e:
 				logger.error(f'Failed to upload file: {e}')
