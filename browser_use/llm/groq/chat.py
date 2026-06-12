@@ -168,19 +168,23 @@ class ChatGroq(BaseChatModel):
 		"""Handle structured output using either tool calling or JSON schema."""
 		schema = SchemaOptimizer.create_optimized_json_schema(output_format)
 
-		if self.model in ToolCallingModels:
+		if self.model in ToolCallingModels or 'llama' in self.model.lower():
 			response = await self._invoke_with_tool_calling(groq_messages, output_format, schema)
 		else:
 			response = await self._invoke_with_json_schema(groq_messages, output_format, schema)
 
-		if not response.choices[0].message.content:
+		content = response.choices[0].message.content
+		if not content and response.choices[0].message.tool_calls:
+			content = response.choices[0].message.tool_calls[0].function.arguments
+
+		if not content:
 			raise ModelProviderError(
 				message='No content in response',
 				status_code=500,
 				model=self.name,
 			)
 
-		parsed_response = output_format.model_validate_json(response.choices[0].message.content)
+		parsed_response = output_format.model_validate_json(content)
 		usage = self._get_usage(response)
 
 		return ChatInvokeCompletion(
@@ -213,19 +217,42 @@ class ChatGroq(BaseChatModel):
 
 	async def _invoke_with_json_schema(self, groq_messages, output_format: type[T], schema) -> ChatCompletion:
 		"""Handle structured output using JSON schema."""
-		return await self.get_client().chat.completions.create(
-			model=self.model,
-			messages=groq_messages,
-			temperature=self.temperature,
-			top_p=self.top_p,
-			seed=self.seed,
-			response_format=ResponseFormatResponseFormatJsonSchema(
-				json_schema=ResponseFormatResponseFormatJsonSchemaJsonSchema(
-					name=output_format.__name__,
-					description='Model output schema',
-					schema=schema,
+		if 'llama' in self.model.lower():
+			return await self.get_client().chat.completions.create(
+				model=self.model,
+				messages=groq_messages,
+				temperature=self.temperature,
+				top_p=self.top_p,
+				seed=self.seed,
+				response_format={"type": "json_object"},
+				service_tier=self.service_tier,
+			)
+		try:
+			return await self.get_client().chat.completions.create(
+				model=self.model,
+				messages=groq_messages,
+				temperature=self.temperature,
+				top_p=self.top_p,
+				seed=self.seed,
+				response_format=ResponseFormatResponseFormatJsonSchema(
+					json_schema=ResponseFormatResponseFormatJsonSchemaJsonSchema(
+						name=output_format.__name__,
+						description='Model output schema',
+						schema=schema,
+					),
+					type='json_schema',
 				),
-				type='json_schema',
-			),
-			service_tier=self.service_tier,
-		)
+				service_tier=self.service_tier,
+			)
+		except Exception as e:
+			if 'json_schema' in str(e) or 'ResponseFormat' in str(e):
+				return await self.get_client().chat.completions.create(
+					model=self.model,
+					messages=groq_messages,
+					temperature=self.temperature,
+					top_p=self.top_p,
+					seed=self.seed,
+					response_format={"type": "json_object"},
+					service_tier=self.service_tier,
+				)
+			raise

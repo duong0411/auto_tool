@@ -30,6 +30,7 @@ class ScreenshotService:
 		# Decode base64 and save to disk
 		screenshot_data = base64.b64decode(screenshot_b64)
 
+		self.screenshots_dir.mkdir(parents=True, exist_ok=True)
 		async with await anyio.open_file(screenshot_path, 'wb') as f:
 			await f.write(screenshot_data)
 

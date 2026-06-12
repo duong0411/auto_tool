@@ -62,6 +62,7 @@ class ChatOpenAI(BaseChatModel):
 	http_client: httpx.AsyncClient | None = None
 	_strict_response_validation: bool = False
 	max_completion_tokens: int | None = 4096
+	extra_body: dict[str, Any] | None = None
 	reasoning_models: list[ChatModel | str] | None = field(
 		default_factory=lambda: [
 			'o4-mini',
@@ -176,6 +177,7 @@ class ChatOpenAI(BaseChatModel):
 
 			if self.max_completion_tokens is not None:
 				model_params['max_completion_tokens'] = self.max_completion_tokens
+				model_params['max_tokens'] = self.max_completion_tokens
 
 			if self.top_p is not None:
 				model_params['top_p'] = self.top_p
@@ -190,6 +192,9 @@ class ChatOpenAI(BaseChatModel):
 				model_params['reasoning_effort'] = self.reasoning_effort
 				model_params.pop('temperature', None)
 				model_params.pop('frequency_penalty', None)
+
+			if self.extra_body is not None:
+				model_params['extra_body'] = self.extra_body
 
 			if output_format is None:
 				# Return string response
@@ -215,8 +220,12 @@ class ChatOpenAI(BaseChatModel):
 					)
 
 				usage = self._get_usage(response)
+				# Ollama thinking models put output in 'reasoning' field, not 'content'
+				raw_content = choice.message.content or ''
+				if not raw_content and hasattr(choice.message, 'model_extra') and choice.message.model_extra:
+					raw_content = choice.message.model_extra.get('reasoning', '')
 				return ChatInvokeCompletion(
-					completion=choice.message.content or '',
+					completion=raw_content,
 					usage=usage,
 					stop_reason=choice.finish_reason,
 				)
@@ -272,16 +281,112 @@ class ChatOpenAI(BaseChatModel):
 						model=self.name,
 					)
 
-				if choice.message.content is None:
+				# --- Robust content extraction for Ollama thinking models ---
+				# Ollama qwen3-vl:8b-thinking is unpredictable:
+				#   - Sometimes: content="", reasoning="...thinking...{JSON}..."
+				#   - Sometimes: content="Let me analyze...", reasoning="...{JSON}..."
+				#   - Sometimes: content="{JSON}", reasoning="..."
+				# Strategy: collect text from BOTH fields, search for valid JSON in each.
+				raw_content = choice.message.content or ''
+				raw_reasoning = ''
+				if hasattr(choice.message, 'model_extra') and choice.message.model_extra:
+					raw_reasoning = choice.message.model_extra.get('reasoning', '') or ''
+
+				if not raw_content and not raw_reasoning:
 					raise ModelProviderError(
-						message='Failed to parse structured output from model response',
+						message='Failed to parse structured output from model response (content and reasoning both empty)',
 						status_code=500,
 						model=self.name,
 					)
 
 				usage = self._get_usage(response)
 
-				parsed = output_format.model_validate_json(choice.message.content)
+				def _strip_thinking_and_markdown(text: str) -> str:
+					"""Strip thinking tags and markdown code fences from text."""
+					if '</thought>' in text:
+						text = text.split('</thought>', 1)[1]
+					elif '</think>' in text:
+						text = text.split('</think>', 1)[1]
+					text = text.strip()
+					if text.startswith('```'):
+						first_nl = text.find('\n')
+						if first_nl != -1:
+							text = text[first_nl:]
+						if text.endswith('```'):
+							text = text[:-3]
+						text = text.strip()
+					return text
+
+				def _find_balanced_json_objects(text: str) -> list[str]:
+					"""Find all top-level balanced { } substrings in text."""
+					candidates = []
+					depth = 0
+					start_idx = -1
+					in_string = False
+					escape_next = False
+					for i, ch in enumerate(text):
+						if escape_next:
+							escape_next = False
+							continue
+						if ch == '\\' and in_string:
+							escape_next = True
+							continue
+						if ch == '"' and not escape_next:
+							in_string = not in_string
+							continue
+						if in_string:
+							continue
+						if ch == '{':
+							if depth == 0:
+								start_idx = i
+							depth += 1
+						elif ch == '}':
+							depth -= 1
+							if depth == 0 and start_idx >= 0:
+								candidates.append(text[start_idx : i + 1])
+								start_idx = -1
+					return candidates
+
+				# Try to find valid JSON in multiple sources, in priority order:
+				# 1. raw_content (if model put JSON directly in content)
+				# 2. raw_reasoning (if model put JSON inside reasoning)
+				sources_to_try = []
+				if raw_content:
+					sources_to_try.append(_strip_thinking_and_markdown(raw_content))
+				if raw_reasoning:
+					sources_to_try.append(_strip_thinking_and_markdown(raw_reasoning))
+
+				parsed = None
+				for source in sources_to_try:
+					candidates = _find_balanced_json_objects(source)
+					if not candidates:
+						continue
+					# Try from last to first (final answer is usually at the end)
+					for candidate in reversed(candidates):
+						try:
+							parsed = output_format.model_validate_json(candidate)
+							break
+						except Exception:
+							continue
+					if parsed is not None:
+						break
+
+				# Final fallback: simple first-{ to last-} extraction on combined text
+				if parsed is None:
+					combined = _strip_thinking_and_markdown(raw_content + '\n' + raw_reasoning)
+					start = combined.find('{')
+					end = combined.rfind('}')
+					if start != -1 and end != -1 and end > start:
+						# This will raise ModelProviderError if JSON is invalid (via except block below)
+						parsed = output_format.model_validate_json(combined[start : end + 1])
+					else:
+						# No JSON found at all — raise with truncated content for debugging
+						preview = (raw_content or raw_reasoning or '')[:200]
+						raise ModelProviderError(
+							message=f'No JSON object found in model response. Content preview: {preview!r}',
+							status_code=500,
+							model=self.name,
+						)
 
 				return ChatInvokeCompletion(
 					completion=parsed,
